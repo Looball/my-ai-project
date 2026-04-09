@@ -7,9 +7,21 @@ type Message = {
   content: string;
 };
 
+type Attachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  kind: "image" | "document";
+  uploadedAt: string;
+  extractedText: string;
+  storagePath: string;
+};
+
 type ChatSession = {
   id: string;
   title: string;
+  attachments: Attachment[];
   messages: Message[];
 };
 
@@ -34,7 +46,8 @@ function createSession(title = "新对话"): ChatSession {
   return {
     id: crypto.randomUUID(),
     title,
-    messages: initialMessages,
+    attachments: [],
+    messages: [...initialMessages],
   };
 }
 
@@ -48,13 +61,72 @@ function buildSessionTitle(input: string) {
   return normalized.length > 24 ? `${normalized.slice(0, 24)}...` : normalized;
 }
 
+function isMessage(value: unknown): value is Message {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<Message>;
+
+  return (
+    (candidate.role === "user" || candidate.role === "assistant") &&
+    typeof candidate.content === "string"
+  );
+}
+
+function isAttachment(value: unknown): value is Attachment {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<Attachment>;
+
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.name === "string" &&
+    typeof candidate.mimeType === "string" &&
+    typeof candidate.size === "number" &&
+    (candidate.kind === "image" || candidate.kind === "document") &&
+    typeof candidate.uploadedAt === "string" &&
+    typeof candidate.extractedText === "string" &&
+    typeof candidate.storagePath === "string"
+  );
+}
+
+function formatFileSize(size: number) {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function serializeSessionsForStorage(sessions: ChatSession[]) {
+  return JSON.stringify(
+    sessions.map((session) => ({
+      ...session,
+      attachments: session.attachments.map((attachment) => ({
+        ...attachment,
+        extractedText: attachment.extractedText.slice(0, 2000),
+      })),
+    }))
+  );
+}
+
 export default function Home() {
-  const [sessions, setSessions] = useState<ChatSession[]>([createSession()]);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState("");
   const [input, setInput] = useState("");
   const [editingSessionId, setEditingSessionId] = useState("");
   const [editingTitle, setEditingTitle] = useState("");
   const [copiedMessageKey, setCopiedMessageKey] = useState("");
+  const [uploadingSessions, setUploadingSessions] = useState<Record<string, boolean>>(
+    {}
+  );
   const [loadingSessions, setLoadingSessions] = useState<Record<string, boolean>>(
     {}
   );
@@ -67,53 +139,83 @@ export default function Home() {
   const previousLoadingRef = useRef(false);
 
   const currentSession =
-    sessions.find((session) => session.id === currentSessionId) || sessions[0];
+    sessions.find((session) => session.id === currentSessionId) || sessions[0] || null;
   const isCurrentSessionLoading = currentSession
     ? Boolean(loadingSessions[currentSession.id])
+    : false;
+  const isCurrentSessionUploading = currentSession
+    ? Boolean(uploadingSessions[currentSession.id])
     : false;
   const currentSessionError = currentSession
     ? sessionErrors[currentSession.id] || ""
     : "";
 
   useEffect(() => {
-    const savedSessions = localStorage.getItem(STORAGE_KEY);
-    const savedCurrentSessionId = localStorage.getItem(CURRENT_SESSION_KEY);
+    let nextSessions: ChatSession[] = [];
+    let savedCurrentSessionId = "";
 
-    if (savedSessions) {
-      try {
-        const parsedSessions = JSON.parse(savedSessions) as ChatSession[];
+    try {
+      const savedSessions = localStorage.getItem(STORAGE_KEY);
+      savedCurrentSessionId = localStorage.getItem(CURRENT_SESSION_KEY) || "";
+
+      if (savedSessions) {
+        const parsedSessions = JSON.parse(savedSessions) as unknown;
 
         if (Array.isArray(parsedSessions) && parsedSessions.length > 0) {
-          setSessions(parsedSessions);
+          nextSessions = parsedSessions.map((session) => {
+            const messages = Array.isArray(session?.messages)
+              ? session.messages.filter(isMessage)
+              : [];
+            const attachments = Array.isArray(session?.attachments)
+              ? session.attachments.filter(isAttachment)
+              : [];
 
-          if (
-            savedCurrentSessionId &&
-            parsedSessions.some((session) => session.id === savedCurrentSessionId)
-          ) {
-            setCurrentSessionId(savedCurrentSessionId);
-          } else {
-            setCurrentSessionId(parsedSessions[0].id);
-          }
+            return {
+              id:
+                typeof session?.id === "string" && session.id
+                  ? session.id
+                  : crypto.randomUUID(),
+              title:
+                typeof session?.title === "string" && session.title.trim()
+                  ? session.title.trim()
+                  : "新对话",
+              attachments,
+              messages: messages.length > 0 ? messages : [...initialMessages],
+            };
+          });
         }
-      } catch (error) {
-        console.error("Failed to parse saved sessions:", error);
       }
-    } else {
-      setCurrentSessionId((prev) => prev || sessions[0].id);
+    } catch (error) {
+      console.error("Failed to restore saved sessions:", error);
     }
 
+    if (nextSessions.length === 0) {
+      nextSessions = [createSession()];
+    }
+
+    setSessions(nextSessions);
+    setCurrentSessionId(
+      savedCurrentSessionId &&
+        nextSessions.some((session) => session.id === savedCurrentSessionId)
+        ? savedCurrentSessionId
+        : nextSessions[0].id
+    );
     setHasLoaded(true);
   }, []);
 
   useEffect(() => {
-    if (!hasLoaded) {
+    if (!hasLoaded || sessions.length === 0) {
       return;
     }
 
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+    try {
+      localStorage.setItem(STORAGE_KEY, serializeSessionsForStorage(sessions));
 
-    if (currentSessionId) {
-      localStorage.setItem(CURRENT_SESSION_KEY, currentSessionId);
+      if (currentSessionId) {
+        localStorage.setItem(CURRENT_SESSION_KEY, currentSessionId);
+      }
+    } catch (error) {
+      console.error("Failed to persist sessions:", error);
     }
   }, [sessions, currentSessionId, hasLoaded]);
 
@@ -148,6 +250,7 @@ export default function Home() {
       setSessions([resetSession]);
       setCurrentSessionId(resetSession.id);
       setInput("");
+      setUploadingSessions({});
       setLoadingSessions({});
       setSessionErrors({});
       return;
@@ -157,6 +260,11 @@ export default function Home() {
 
     setSessions(remainingSessions);
     setLoadingSessions((prev) => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+    setUploadingSessions((prev) => {
       const next = { ...prev };
       delete next[sessionId];
       return next;
@@ -216,16 +324,111 @@ export default function Home() {
     }
   }
 
-  async function handleSubmit() {
-    if (!input.trim() || isCurrentSessionLoading || !currentSession) {
+  async function handleUploadFiles(files: FileList | null) {
+    if (!currentSession || !files || files.length === 0) {
+      return;
+    }
+
+    setSessionErrors((prev) => ({
+      ...prev,
+      [currentSession.id]: "",
+    }));
+    setUploadingSessions((prev) => ({
+      ...prev,
+      [currentSession.id]: true,
+    }));
+
+    try {
+      const uploadedAttachments: Attachment[] = [];
+
+      for (const file of Array.from(files)) {
+        const formData = new FormData();
+        formData.append("file", file);
+
+        const response = await fetch("/api/uploads", {
+          method: "POST",
+          body: formData,
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || "上传失败了，请稍后再试。");
+        }
+
+        uploadedAttachments.push(data.attachment as Attachment);
+      }
+
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === currentSession.id
+            ? {
+                ...session,
+                attachments: [...uploadedAttachments, ...session.attachments],
+              }
+            : session
+        )
+      );
+    } catch (error) {
+      setSessionErrors((prev) => ({
+        ...prev,
+        [currentSession.id]:
+          error instanceof Error ? error.message : "上传失败了，请稍后再试。",
+      }));
+    } finally {
+      setUploadingSessions((prev) => ({
+        ...prev,
+        [currentSession.id]: false,
+      }));
+    }
+  }
+
+  function handleRemoveAttachment(attachmentId: string) {
+    if (!currentSession) {
+      return;
+    }
+
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === currentSession.id
+          ? {
+              ...session,
+              attachments: session.attachments.filter(
+                (attachment) => attachment.id !== attachmentId
+              ),
+            }
+          : session
+      )
+    );
+  }
+
+  async function handleSubmit(overrideInput?: string) {
+    if (!currentSession || isCurrentSessionLoading) {
+      return;
+    }
+
+    const messageContent = (overrideInput ?? input).trim();
+
+    if (!messageContent) {
+      setSessionErrors((prev) => ({
+        ...prev,
+        [currentSession.id]: "请先在下方输入问题。",
+      }));
       return;
     }
 
     const userMessage: Message = {
       role: "user",
-      content: input,
+      content: messageContent,
     };
 
+    const attachmentContext = currentSession.attachments
+      .filter((attachment) => attachment.extractedText)
+      .map(
+        (attachment) =>
+          `文件名：${attachment.name}\n文件内容：\n${attachment.extractedText}`
+      )
+      .join("\n\n");
     const updatedMessages = [...currentSession.messages, userMessage];
 
     setSessions((prev) =>
@@ -235,7 +438,7 @@ export default function Home() {
               ...session,
               title:
                 session.messages.length === initialMessages.length
-                  ? buildSessionTitle(input)
+                  ? buildSessionTitle(messageContent)
                   : session.title,
               messages: updatedMessages,
             }
@@ -261,6 +464,7 @@ export default function Home() {
         },
         body: JSON.stringify({
           messages: updatedMessages,
+          attachmentContext,
         }),
       });
 
@@ -499,6 +703,52 @@ export default function Home() {
             >
               输入你的问题
             </label>
+            <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <label className="inline-flex cursor-pointer items-center justify-center rounded-2xl border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition hover:border-zinc-400 hover:bg-zinc-100">
+                {isCurrentSessionUploading ? "上传中..." : "上传附件或图片"}
+                <input
+                  type="file"
+                  multiple
+                  disabled={isCurrentSessionUploading}
+                  accept=".txt,.md,.csv,.json,.pdf,image/png,image/jpeg,image/webp,image/gif"
+                  onChange={(e) => {
+                    void handleUploadFiles(e.target.files);
+                    e.currentTarget.value = "";
+                  }}
+                  className="hidden"
+                />
+              </label>
+              <p className="text-sm leading-6 text-zinc-500">
+                可上传图片、PDF 或文本附件。
+              </p>
+            </div>
+
+            {currentSession && currentSession.attachments.length > 0 && (
+              <div className="mb-4 space-y-2">
+                {currentSession.attachments.map((attachment) => (
+                  <div
+                    key={attachment.id}
+                    className="flex flex-col gap-2 rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-3 md:flex-row md:items-center md:justify-between"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-zinc-800">
+                        {attachment.name}
+                      </div>
+                      <div className="mt-1 text-xs text-zinc-500">
+                        {attachment.kind === "image" ? "图片" : "附件"} · {formatFileSize(attachment.size)} · {attachment.mimeType}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => handleRemoveAttachment(attachment.id)}
+                      className="rounded-lg px-2 py-1 text-xs text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900"
+                    >
+                      移除
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <textarea
               id="question"
               value={input}
@@ -506,19 +756,25 @@ export default function Home() {
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey && !isCurrentSessionLoading) {
                   e.preventDefault();
-                  handleSubmit();
+                  void handleSubmit();
                 }
               }}
-              placeholder="比如：什么是大语言模型？"
+              placeholder="比如：请结合上传的附件，解释一下 RAG 的核心概念。"
               className="min-h-[120px] w-full rounded-2xl border border-zinc-300 bg-white px-4 py-3 text-zinc-900 outline-none transition focus:border-zinc-500 focus:ring-2 focus:ring-zinc-200"
             />
 
             <button
-              onClick={handleSubmit}
-              disabled={isCurrentSessionLoading}
+              onClick={() => {
+                void handleSubmit();
+              }}
+              disabled={isCurrentSessionLoading || isCurrentSessionUploading}
               className="mt-4 inline-flex items-center rounded-2xl bg-zinc-900 px-5 py-3 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:bg-zinc-400"
             >
-              {isCurrentSessionLoading ? "思考中..." : "发送消息"}
+              {isCurrentSessionLoading
+                ? "思考中..."
+                : isCurrentSessionUploading
+                  ? "上传中..."
+                  : "发送消息"}
             </button>
           </div>
         </section>
