@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
@@ -29,10 +30,68 @@ function sanitizeFilename(filename: string) {
   return normalized || "upload";
 }
 
+function toResponseAttachment(attachment: {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  kind: string;
+  uploadedAt: Date;
+  extractedText: string;
+  storagePath: string;
+}) {
+  return {
+    ...attachment,
+    kind: attachment.kind as "image" | "document",
+    uploadedAt: attachment.uploadedAt.toISOString(),
+  };
+}
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const sessionId = searchParams.get("sessionId")?.trim();
+
+  if (!sessionId) {
+    return NextResponse.json(
+      { error: "缺少 sessionId。" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const attachments = await prisma.attachment.findMany({
+      where: { sessionId },
+      orderBy: { uploadedAt: "desc" },
+    });
+
+    return NextResponse.json({
+      attachments: attachments.map(toResponseAttachment),
+    });
+  } catch (error) {
+    console.error("Load uploads error:", error);
+
+    return NextResponse.json(
+      { error: "读取附件失败了，请稍后再试。" },
+      { status: 500 }
+    );
+  }
+}
+
 export async function POST(request: Request) {
   try {
     const formData = await request.formData();
     const file = formData.get("file");
+    const sessionId =
+      typeof formData.get("sessionId") === "string"
+        ? String(formData.get("sessionId")).trim()
+        : "";
+
+    if (!sessionId) {
+      return NextResponse.json(
+        { error: "缺少会话标识，无法上传文件。" },
+        { status: 400 }
+      );
+    }
 
     if (!(file instanceof File)) {
       return NextResponse.json(
@@ -80,25 +139,55 @@ export async function POST(request: Request) {
     const buffer = Buffer.from(arrayBuffer);
     await writeFile(storedPath, buffer);
 
-    const extractedText = isText ? buffer.toString("utf8").trim() : "";
-
-    return NextResponse.json({
-      attachment: {
+    const attachment = await prisma.attachment.create({
+      data: {
         id,
+        sessionId,
         name: sanitizeFilename(file.name),
         mimeType,
         size: file.size,
         kind: isImage ? "image" : "document",
-        uploadedAt: new Date().toISOString(),
-        extractedText,
+        uploadedAt: new Date(),
+        extractedText: isText ? buffer.toString("utf8").trim() : "",
         storagePath: storedPath,
       },
+    });
+
+    return NextResponse.json({
+      attachment: toResponseAttachment(attachment),
     });
   } catch (error) {
     console.error("Upload error:", error);
 
     return NextResponse.json(
       { error: "上传失败了，请稍后再试。" },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const attachmentId = searchParams.get("attachmentId")?.trim();
+
+  if (!attachmentId) {
+    return NextResponse.json(
+      { error: "缺少 attachmentId。" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    await prisma.attachment.delete({
+      where: { id: attachmentId },
+    });
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error("Delete upload error:", error);
+
+    return NextResponse.json(
+      { error: "删除附件失败了，请稍后再试。" },
       { status: 500 }
     );
   }

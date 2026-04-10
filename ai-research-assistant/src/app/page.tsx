@@ -151,6 +151,38 @@ export default function Home() {
     : "";
 
   useEffect(() => {
+    async function loadAttachments(sessionId: string) {
+      try {
+        const response = await fetch(
+          `/api/uploads?sessionId=${encodeURIComponent(sessionId)}`
+        );
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || "读取附件失败了，请稍后再试。");
+        }
+
+        setSessions((prev) =>
+          prev.map((session) =>
+            session.id === sessionId
+              ? {
+                  ...session,
+                  attachments: data.attachments as Attachment[],
+                }
+              : session
+          )
+        );
+      } catch (error) {
+        console.error("Failed to load attachments:", error);
+      }
+    }
+
+    if (currentSession?.id) {
+      void loadAttachments(currentSession.id);
+    }
+  }, [currentSession?.id]);
+
+  useEffect(() => {
     let nextSessions: ChatSession[] = [];
     let savedCurrentSessionId = "";
 
@@ -344,6 +376,7 @@ export default function Home() {
       for (const file of Array.from(files)) {
         const formData = new FormData();
         formData.append("file", file);
+        formData.append("sessionId", currentSession.id);
 
         const response = await fetch("/api/uploads", {
           method: "POST",
@@ -383,23 +416,43 @@ export default function Home() {
     }
   }
 
-  function handleRemoveAttachment(attachmentId: string) {
+  async function handleRemoveAttachment(attachmentId: string) {
     if (!currentSession) {
       return;
     }
 
-    setSessions((prev) =>
-      prev.map((session) =>
-        session.id === currentSession.id
-          ? {
-              ...session,
-              attachments: session.attachments.filter(
-                (attachment) => attachment.id !== attachmentId
-              ),
-            }
-          : session
-      )
-    );
+    try {
+      const response = await fetch(
+        `/api/uploads?attachmentId=${encodeURIComponent(attachmentId)}`,
+        {
+          method: "DELETE",
+        }
+      );
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "删除附件失败了，请稍后再试。");
+      }
+
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === currentSession.id
+            ? {
+                ...session,
+                attachments: session.attachments.filter(
+                  (attachment) => attachment.id !== attachmentId
+                ),
+              }
+            : session
+        )
+      );
+    } catch (error) {
+      setSessionErrors((prev) => ({
+        ...prev,
+        [currentSession.id]:
+          error instanceof Error ? error.message : "删除附件失败了，请稍后再试。",
+      }));
+    }
   }
 
   async function handleSubmit(overrideInput?: string) {
@@ -739,7 +792,9 @@ export default function Home() {
                       </div>
                     </div>
                     <button
-                      onClick={() => handleRemoveAttachment(attachment.id)}
+                      onClick={() => {
+                        void handleRemoveAttachment(attachment.id);
+                      }}
                       className="rounded-lg px-2 py-1 text-xs text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900"
                     >
                       移除
